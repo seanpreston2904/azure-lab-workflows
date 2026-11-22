@@ -1,0 +1,24 @@
+name: Terraform Apply Manual
+
+on:
+    workflow_dispatch:
+        inputs:
+            solution:
+                description: "Solution directory (e.g. terraform/solutions/identity/tf-state)"
+                required: true
+                type: string
+
+permissions:
+    id-token: write
+    contents: read
+
+jobs:
+    apply:
+        uses: seanpreston2904/azure-lab-workflows/.github/workflows/tf_apply_manual.yml@v1
+        with:
+            solution: ${{ inputs.solution }}
+            state_resource_group: rg-tf-state-aue
+            state_storage_account: stspdevtfstate
+            state_container: sub-management
+            state_key_strip_prefix: terraform/solutions/
+        secrets: inherit

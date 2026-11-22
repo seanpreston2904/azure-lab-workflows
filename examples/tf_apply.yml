@@ -1,0 +1,23 @@
+name: Terraform Apply
+
+on:
+    push:
+        branches: [master]
+
+permissions:
+    id-token: write
+    contents: read
+    actions: read
+    pull-requests: read
+
+jobs:
+    apply:
+        uses: seanpreston2904/azure-lab-workflows/.github/workflows/tf_apply.yml@v1
+        with:
+            state_resource_group: rg-tf-state-aue
+            state_storage_account: stspdevtfstate
+            state_container: sub-management
+            state_key_strip_prefix: terraform/solutions/
+            # File name of the caller workflow that runs the plan (tf_plan.yml above)
+            plan_workflow_file: tf_plan.yml
+        secrets: inherit
