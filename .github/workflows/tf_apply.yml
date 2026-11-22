@@ -1,0 +1,274 @@
+name: Terraform Apply (reusable)
+
+# Applies the plan that was reviewed on the pull request. On a push to the
+# default branch it finds the merged PR, locates the successful plan run for
+# that PR's head commit, downloads the saved plan file for each changed
+# solution and applies it.
+#
+# Call this from a push workflow on the default branch. The caller must grant:
+# id-token: write, contents: read, actions: read, pull-requests: read.
+
+on:
+    workflow_call:
+        inputs:
+            state_resource_group:
+                description: "Resource group of the storage account that holds Terraform state"
+                required: true
+                type: string
+            state_storage_account:
+                description: "Storage account that holds Terraform state"
+                required: true
+                type: string
+            state_container:
+                description: "Blob container that holds Terraform state"
+                required: true
+                type: string
+            state_key_strip_prefix:
+                description: "Must match the value passed to the plan workflow."
+                required: false
+                type: string
+                default: ""
+            plan_workflow_file:
+                description: "File name of the caller's workflow that calls tf_plan.yml (used to find the reviewed plan run)"
+                required: false
+                type: string
+                default: "tf_plan.yml"
+            terraform_version:
+                required: false
+                type: string
+                default: "1.17.2"
+            plan_environment:
+                description: "GitHub environment for the verify job. Part of the OIDC subject."
+                required: false
+                type: string
+                default: "terraform-plan"
+            apply_environment:
+                description: "GitHub environment for the apply job. Part of the OIDC subject; put required reviewers here."
+                required: false
+                type: string
+                default: "terraform-apply"
+        secrets:
+            TF_CLIENT_ID:
+                required: true
+            TF_TENANT_ID:
+                required: true
+            TF_SUBSCRIPTION_ID:
+                required: true
+
+jobs:
+    detect_solutions:
+        name: Detect Changed Solutions
+        runs-on: ubuntu-latest
+
+        outputs:
+            solutions: ${{ steps.detect.outputs.solutions }}
+            plan_run_id: ${{ steps.resolve_plan.outputs.plan_run_id }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+
+            - name: Detect changed solution directories
+              id: detect
+              env:
+                BEFORE_SHA: ${{ github.event.before }}
+                AFTER_SHA: ${{ github.event.after }}
+              run: |
+                  set -euo pipefail
+
+                  before="$BEFORE_SHA"
+                  if [ "$before" = "0000000000000000000000000000000000000000" ]; then
+                      before="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+                  fi
+
+                  changed_files=$(git diff --name-only "$before" "$AFTER_SHA")
+
+                  solutions=()
+                  while IFS= read -r file; do
+                      [ -z "$file" ] && continue
+                      dir=$(dirname "$file")
+                      while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
+                          if [ -f "$dir/main.tf" ]; then
+                              solutions+=("$dir")
+                              break
+                          fi
+                          dir=$(dirname "$dir")
+                      done
+                  done <<< "$changed_files"
+
+                  unique_solutions=$(printf '%s\n' "${solutions[@]:-}" | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+                  echo "Detected solutions: $unique_solutions"
+                  echo "solutions=$unique_solutions" >> "$GITHUB_OUTPUT"
+
+            - name: Resolve source PR's plan run
+              id: resolve_plan
+              if: steps.detect.outputs.solutions != '[]'
+              env:
+                GH_TOKEN: ${{ github.token }}
+                REPO: ${{ github.repository }}
+                MERGE_SHA: ${{ github.event.after }}
+                PLAN_WORKFLOW: ${{ inputs.plan_workflow_file }}
+              run: |
+                  set -euo pipefail
+
+                  pr_number=$(gh api "repos/$REPO/commits/$MERGE_SHA/pulls" --jq '.[0].number')
+                  if [ -z "$pr_number" ] || [ "$pr_number" = "null" ]; then
+                      echo "::error::No pull request associated with commit $MERGE_SHA - cannot locate a reviewed plan to apply."
+                      exit 1
+                  fi
+
+                  head_sha=$(gh api "repos/$REPO/pulls/$pr_number" --jq '.head.sha')
+                  echo "Source PR #$pr_number, head SHA $head_sha"
+
+                  plan_run_id=$(gh api "repos/$REPO/actions/workflows/$PLAN_WORKFLOW/runs?head_sha=$head_sha&status=success" \
+                      --jq '.workflow_runs[0].id')
+                  if [ -z "$plan_run_id" ] || [ "$plan_run_id" = "null" ]; then
+                      echo "::error::No successful run of $PLAN_WORKFLOW found for PR #$pr_number (head $head_sha). Re-run the plan before merging."
+                      exit 1
+                  fi
+
+                  echo "Using plan run $plan_run_id"
+                  echo "plan_run_id=$plan_run_id" >> "$GITHUB_OUTPUT"
+
+    verify_plan:
+        name: Verify Plan (${{ matrix.solution }})
+        needs: detect_solutions
+        if: needs.detect_solutions.outputs.solutions != '[]'
+        runs-on: ubuntu-latest
+
+        environment: ${{ inputs.plan_environment }}
+
+        strategy:
+            fail-fast: false
+            matrix:
+                solution: ${{ fromJson(needs.detect_solutions.outputs.solutions) }}
+
+        defaults:
+            run:
+                working-directory: ${{ matrix.solution }}
+
+        env:
+            SOLUTION: ${{ matrix.solution }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Compute state key and artifact name
+              id: names
+              env:
+                STRIP_PREFIX: ${{ inputs.state_key_strip_prefix }}
+              run: |
+                  set -euo pipefail
+                  echo "state_key=${SOLUTION#"$STRIP_PREFIX"}.tfstate" >> "$GITHUB_OUTPUT"
+                  echo "artifact=tfplan-$(echo "$SOLUTION" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+            - name: Download reviewed plan
+              env:
+                GH_TOKEN: ${{ github.token }}
+                REPO: ${{ github.repository }}
+                PLAN_RUN_ID: ${{ needs.detect_solutions.outputs.plan_run_id }}
+                ARTIFACT: ${{ steps.names.outputs.artifact }}
+              run: gh run download "$PLAN_RUN_ID" --repo "$REPO" --name "$ARTIFACT" --dir .
+
+            - name: Log in to Azure
+              uses: azure/login@v3
+              with:
+                client-id: ${{ secrets.TF_CLIENT_ID }}
+                tenant-id: ${{ secrets.TF_TENANT_ID }}
+                subscription-id: ${{ secrets.TF_SUBSCRIPTION_ID }}
+
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v3
+              with:
+                terraform_version: ${{ inputs.terraform_version }}
+
+            - name: Terraform Init
+              env:
+                STATE_RG: ${{ inputs.state_resource_group }}
+                STATE_SA: ${{ inputs.state_storage_account }}
+                STATE_CONTAINER: ${{ inputs.state_container }}
+                STATE_KEY: ${{ steps.names.outputs.state_key }}
+              run: |
+                  terraform init -input=false \
+                      -backend-config="resource_group_name=$STATE_RG" \
+                      -backend-config="storage_account_name=$STATE_SA" \
+                      -backend-config="container_name=$STATE_CONTAINER" \
+                      -backend-config="key=$STATE_KEY" \
+                      -backend-config="use_azuread_auth=true"
+
+            - name: Show plan
+              run: terraform show -no-color tfplan
+
+    terraform_apply:
+        name: Terraform Apply (${{ matrix.solution }})
+        needs: [detect_solutions, verify_plan]
+        if: needs.detect_solutions.outputs.solutions != '[]'
+        runs-on: ubuntu-latest
+
+        environment: ${{ inputs.apply_environment }}
+
+        strategy:
+            fail-fast: false
+            matrix:
+                solution: ${{ fromJson(needs.detect_solutions.outputs.solutions) }}
+
+        defaults:
+            run:
+                working-directory: ${{ matrix.solution }}
+
+        env:
+            SOLUTION: ${{ matrix.solution }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Compute state key and artifact name
+              id: names
+              env:
+                STRIP_PREFIX: ${{ inputs.state_key_strip_prefix }}
+              run: |
+                  set -euo pipefail
+                  echo "state_key=${SOLUTION#"$STRIP_PREFIX"}.tfstate" >> "$GITHUB_OUTPUT"
+                  echo "artifact=tfplan-$(echo "$SOLUTION" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+            - name: Download reviewed plan
+              env:
+                GH_TOKEN: ${{ github.token }}
+                REPO: ${{ github.repository }}
+                PLAN_RUN_ID: ${{ needs.detect_solutions.outputs.plan_run_id }}
+                ARTIFACT: ${{ steps.names.outputs.artifact }}
+              run: gh run download "$PLAN_RUN_ID" --repo "$REPO" --name "$ARTIFACT" --dir .
+
+            - name: Log in to Azure
+              uses: azure/login@v3
+              with:
+                client-id: ${{ secrets.TF_CLIENT_ID }}
+                tenant-id: ${{ secrets.TF_TENANT_ID }}
+                subscription-id: ${{ secrets.TF_SUBSCRIPTION_ID }}
+
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v3
+              with:
+                terraform_version: ${{ inputs.terraform_version }}
+
+            - name: Terraform Init
+              env:
+                STATE_RG: ${{ inputs.state_resource_group }}
+                STATE_SA: ${{ inputs.state_storage_account }}
+                STATE_CONTAINER: ${{ inputs.state_container }}
+                STATE_KEY: ${{ steps.names.outputs.state_key }}
+              run: |
+                  terraform init -input=false \
+                      -backend-config="resource_group_name=$STATE_RG" \
+                      -backend-config="storage_account_name=$STATE_SA" \
+                      -backend-config="container_name=$STATE_CONTAINER" \
+                      -backend-config="key=$STATE_KEY" \
+                      -backend-config="use_azuread_auth=true"
+
+            - name: Terraform Apply
+              run: terraform apply -input=false tfplan

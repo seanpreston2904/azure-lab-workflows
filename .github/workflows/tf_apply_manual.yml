@@ -1,0 +1,210 @@
+name: Terraform Apply Manual (reusable)
+
+# Recovery path: plans and applies a single solution from the default branch
+# without needing a merged PR. Plan and apply are separate jobs, each in its
+# own environment, so the apply environment's reviewers still gate the change.
+#
+# Call this from a workflow_dispatch workflow in the solution repo. The caller
+# must grant: id-token: write, contents: read.
+
+on:
+    workflow_call:
+        inputs:
+            solution:
+                description: "Solution directory to plan and apply (e.g. terraform/solutions/identity/tf-state)"
+                required: true
+                type: string
+            state_resource_group:
+                required: true
+                type: string
+            state_storage_account:
+                required: true
+                type: string
+            state_container:
+                required: true
+                type: string
+            state_key:
+                description: >-
+                    Explicit state key. Leave empty to derive it from the solution path
+                    (same rule as the plan and apply workflows).
+                required: false
+                type: string
+                default: ""
+            state_key_strip_prefix:
+                description: "Used only when state_key is empty."
+                required: false
+                type: string
+                default: ""
+            terraform_version:
+                required: false
+                type: string
+                default: "1.17.2"
+            plan_environment:
+                required: false
+                type: string
+                default: "terraform-plan"
+            apply_environment:
+                required: false
+                type: string
+                default: "terraform-apply"
+        secrets:
+            TF_CLIENT_ID:
+                required: true
+            TF_TENANT_ID:
+                required: true
+            TF_SUBSCRIPTION_ID:
+                required: true
+
+jobs:
+    plan:
+        name: Plan (${{ inputs.solution }})
+        runs-on: ubuntu-latest
+
+        environment: ${{ inputs.plan_environment }}
+
+        outputs:
+            state_key: ${{ steps.names.outputs.state_key }}
+
+        defaults:
+            run:
+                working-directory: ${{ inputs.solution }}
+
+        env:
+            SOLUTION: ${{ inputs.solution }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Validate solution path and branch
+              env:
+                REF: ${{ github.ref }}
+                DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+              run: |
+                  case "$SOLUTION" in
+                      *..*|/*)
+                          echo "::error::Solution path must be relative and must not contain '..'."
+                          exit 1
+                          ;;
+                  esac
+
+                  if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+                      echo "::error::This recovery workflow must be run from $DEFAULT_BRANCH, not $REF."
+                      exit 1
+                  fi
+
+                  if [ ! -f "main.tf" ]; then
+                      echo "::error::No main.tf found in '$SOLUTION' - check the path."
+                      exit 1
+                  fi
+
+            - name: Compute state key
+              id: names
+              env:
+                EXPLICIT_KEY: ${{ inputs.state_key }}
+                STRIP_PREFIX: ${{ inputs.state_key_strip_prefix }}
+              run: |
+                  set -euo pipefail
+                  if [ -n "$EXPLICIT_KEY" ]; then
+                      key="$EXPLICIT_KEY"
+                  else
+                      key="${SOLUTION#"$STRIP_PREFIX"}.tfstate"
+                  fi
+                  echo "state_key=$key" >> "$GITHUB_OUTPUT"
+
+            - name: Log in to Azure
+              uses: azure/login@v3
+              with:
+                client-id: ${{ secrets.TF_CLIENT_ID }}
+                tenant-id: ${{ secrets.TF_TENANT_ID }}
+                subscription-id: ${{ secrets.TF_SUBSCRIPTION_ID }}
+
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v3
+              with:
+                terraform_version: ${{ inputs.terraform_version }}
+
+            - name: Terraform Init
+              env:
+                STATE_RG: ${{ inputs.state_resource_group }}
+                STATE_SA: ${{ inputs.state_storage_account }}
+                STATE_CONTAINER: ${{ inputs.state_container }}
+                STATE_KEY: ${{ steps.names.outputs.state_key }}
+              run: |
+                  terraform init -input=false \
+                      -backend-config="resource_group_name=$STATE_RG" \
+                      -backend-config="storage_account_name=$STATE_SA" \
+                      -backend-config="container_name=$STATE_CONTAINER" \
+                      -backend-config="key=$STATE_KEY" \
+                      -backend-config="use_azuread_auth=true"
+
+            - name: Terraform Plan
+              run: |
+                  set -o pipefail
+                  terraform plan -no-color -input=false -out=tfplan | tee plan_output.txt
+
+            - name: Add plan to job summary
+              run: |
+                  {
+                      echo "### Manual Terraform Plan — \`$SOLUTION\`"
+                      echo '```'
+                      cat plan_output.txt
+                      echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Upload plan artifact
+              uses: actions/upload-artifact@v4
+              with:
+                name: tfplan-manual-${{ github.run_id }}
+                path: ${{ inputs.solution }}/tfplan
+                retention-days: 1
+
+    apply:
+        name: Apply (${{ inputs.solution }})
+        needs: plan
+        runs-on: ubuntu-latest
+
+        environment: ${{ inputs.apply_environment }}
+
+        defaults:
+            run:
+                working-directory: ${{ inputs.solution }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Download plan artifact
+              uses: actions/download-artifact@v4
+              with:
+                name: tfplan-manual-${{ github.run_id }}
+                path: ${{ inputs.solution }}
+
+            - name: Log in to Azure
+              uses: azure/login@v3
+              with:
+                client-id: ${{ secrets.TF_CLIENT_ID }}
+                tenant-id: ${{ secrets.TF_TENANT_ID }}
+                subscription-id: ${{ secrets.TF_SUBSCRIPTION_ID }}
+
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v3
+              with:
+                terraform_version: ${{ inputs.terraform_version }}
+
+            - name: Terraform Init
+              env:
+                STATE_RG: ${{ inputs.state_resource_group }}
+                STATE_SA: ${{ inputs.state_storage_account }}
+                STATE_CONTAINER: ${{ inputs.state_container }}
+                STATE_KEY: ${{ needs.plan.outputs.state_key }}
+              run: |
+                  terraform init -input=false \
+                      -backend-config="resource_group_name=$STATE_RG" \
+                      -backend-config="storage_account_name=$STATE_SA" \
+                      -backend-config="container_name=$STATE_CONTAINER" \
+                      -backend-config="key=$STATE_KEY" \
+                      -backend-config="use_azuread_auth=true"
+
+            - name: Terraform Apply
+              run: terraform apply -input=false tfplan

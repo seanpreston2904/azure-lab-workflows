@@ -1,0 +1,267 @@
+name: Terraform Plan (reusable)
+
+# Runs `terraform plan` for every solution directory (a directory containing
+# main.tf) touched by a pull request, posts the plan as a PR comment and
+# uploads the plan file so tf_apply.yml can apply exactly what was reviewed.
+#
+# Call this from a pull_request workflow in the solution repo. The caller must
+# grant: id-token: write, contents: read, pull-requests: write.
+
+on:
+    workflow_call:
+        inputs:
+            state_resource_group:
+                description: "Resource group of the storage account that holds Terraform state"
+                required: true
+                type: string
+            state_storage_account:
+                description: "Storage account that holds Terraform state"
+                required: true
+                type: string
+            state_container:
+                description: "Blob container that holds Terraform state"
+                required: true
+                type: string
+            state_key_strip_prefix:
+                description: >-
+                    Prefix removed from the solution path when deriving the state key.
+                    Key = <solution path minus this prefix>.tfstate
+                    (e.g. strip "terraform/solutions/" so terraform/solutions/identity/tf-state
+                    uses key identity/tf-state.tfstate).
+                required: false
+                type: string
+                default: ""
+            terraform_version:
+                required: false
+                type: string
+                default: "1.17.2"
+            environment:
+                description: "GitHub environment for plan jobs. Part of the OIDC subject, so it must match the federated credential."
+                required: false
+                type: string
+                default: "terraform-plan"
+        secrets:
+            TF_CLIENT_ID:
+                required: true
+            TF_TENANT_ID:
+                required: true
+            TF_SUBSCRIPTION_ID:
+                required: true
+
+jobs:
+    detect_solutions:
+        name: Detect Changed Solutions
+        runs-on: ubuntu-latest
+
+        outputs:
+            solutions: ${{ steps.detect.outputs.solutions }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+
+            - name: Detect changed solution directories
+              id: detect
+              env:
+                BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+              run: |
+                  set -euo pipefail
+
+                  changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+
+                  solutions=()
+                  while IFS= read -r file; do
+                      [ -z "$file" ] && continue
+                      dir=$(dirname "$file")
+                      while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
+                          if [ -f "$dir/main.tf" ]; then
+                              solutions+=("$dir")
+                              break
+                          fi
+                          dir=$(dirname "$dir")
+                      done
+                  done <<< "$changed_files"
+
+                  unique_solutions=$(printf '%s\n' "${solutions[@]:-}" | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+                  echo "Detected solutions: $unique_solutions"
+                  echo "solutions=$unique_solutions" >> "$GITHUB_OUTPUT"
+
+    terraform_plan:
+        name: Terraform Plan (${{ matrix.solution }})
+        needs: detect_solutions
+        if: needs.detect_solutions.outputs.solutions != '[]'
+        runs-on: ubuntu-latest
+
+        environment: ${{ inputs.environment }}
+
+        strategy:
+            fail-fast: false
+            matrix:
+                solution: ${{ fromJson(needs.detect_solutions.outputs.solutions) }}
+
+        defaults:
+            run:
+                working-directory: ${{ matrix.solution }}
+
+        env:
+            SOLUTION: ${{ matrix.solution }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Compute state key and artifact name
+              id: names
+              env:
+                STRIP_PREFIX: ${{ inputs.state_key_strip_prefix }}
+              run: |
+                  set -euo pipefail
+                  key="${SOLUTION#"$STRIP_PREFIX"}.tfstate"
+                  echo "state_key=$key" >> "$GITHUB_OUTPUT"
+                  echo "artifact=tfplan-$(echo "$SOLUTION" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+                  echo "State key: $key"
+
+            - name: Log in to Azure
+              uses: azure/login@v3
+              with:
+                client-id: ${{ secrets.TF_CLIENT_ID }}
+                tenant-id: ${{ secrets.TF_TENANT_ID }}
+                subscription-id: ${{ secrets.TF_SUBSCRIPTION_ID }}
+
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v3
+              with:
+                terraform_version: ${{ inputs.terraform_version }}
+
+            - name: Terraform Init
+              env:
+                STATE_RG: ${{ inputs.state_resource_group }}
+                STATE_SA: ${{ inputs.state_storage_account }}
+                STATE_CONTAINER: ${{ inputs.state_container }}
+                STATE_KEY: ${{ steps.names.outputs.state_key }}
+              run: |
+                  terraform init -input=false \
+                      -backend-config="resource_group_name=$STATE_RG" \
+                      -backend-config="storage_account_name=$STATE_SA" \
+                      -backend-config="container_name=$STATE_CONTAINER" \
+                      -backend-config="key=$STATE_KEY" \
+                      -backend-config="use_azuread_auth=true"
+
+            - name: Terraform Plan
+              id: plan
+              run: |
+                  set -o pipefail
+                  terraform plan -no-color -input=false -out=tfplan | tee plan_output.txt
+
+            - name: Upload plan artifact
+              uses: actions/upload-artifact@v4
+              with:
+                name: ${{ steps.names.outputs.artifact }}
+                path: ${{ matrix.solution }}/tfplan
+                retention-days: 14
+
+            - name: Format plan markdown
+              if: always() && steps.plan.outcome != 'skipped'
+              run: |
+                  python3 - "$SOLUTION" plan_output.txt > plan_comment.md <<'PY'
+                  """Turn a `terraform plan -no-color` capture into a PR-friendly
+                  markdown comment: one collapsible <details> block per resource."""
+                  import re
+                  import sys
+
+                  ACTION_LABELS = [
+                      (re.compile(r"will be created$"), "\U0001F7E2 Create"),
+                      (re.compile(r"will be destroyed$"), "\U0001F534 Destroy"),
+                      (re.compile(r"will be updated in-place$"), "\U0001F7E1 Update"),
+                      (re.compile(r"will be replaced$"), "\U0001F7E0 Replace"),
+                      (re.compile(r"must be replaced$"), "\U0001F7E0 Replace"),
+                      (re.compile(r"will be read during apply$"), "\U0001F535 Read"),
+                      (re.compile(r"will be imported$"), "\U0001F535 Import"),
+                  ]
+
+                  HEADER_RE = re.compile(r"^  # (.+?) (will be .+|must be replaced)$")
+
+
+                  def label_for(header_text):
+                      for pattern, label in ACTION_LABELS:
+                          if pattern.search(header_text):
+                              return label
+                      return "⚪ Change"
+
+
+                  def split_blocks(lines):
+                      blocks, current = [], None
+                      for line in lines:
+                          if HEADER_RE.match(line):
+                              if current:
+                                  blocks.append(current)
+                              current = [line]
+                          elif current is not None:
+                              if line == "" or line.startswith("Plan:"):
+                                  blocks.append(current)
+                                  current = None
+                              else:
+                                  current.append(line)
+                      if current:
+                          blocks.append(current)
+                      return blocks
+
+
+                  solution, plan_path = sys.argv[1], sys.argv[2]
+                  with open(plan_path) as f:
+                      lines = f.read().splitlines()
+
+                  summary_line = next(
+                      (l for l in lines
+                       if l.startswith(("Plan:", "No changes.", "Error:"))),
+                      None,
+                  )
+                  blocks = split_blocks(lines)
+
+                  parts = [f"<!-- terraform-plan:{solution} -->",
+                           f"### Terraform Plan — `{solution}`"]
+                  if summary_line:
+                      parts.append(f"**{summary_line.strip()}**")
+
+                  if not blocks:
+                      if not summary_line or not summary_line.startswith("No changes"):
+                          parts.append("```\n" + "\n".join(lines[-60:]) + "\n```")
+                  else:
+                      for block in blocks:
+                          match = HEADER_RE.match(block[0])
+                          address = match.group(1) if match else "resource"
+                          parts.append(
+                              f"<details>\n<summary>{label_for(block[0])} — "
+                              f"<code>{address}</code></summary>\n\n"
+                              "```hcl\n" + "\n".join(block) + "\n```\n\n</details>"
+                          )
+
+                  print("\n\n".join(parts))
+                  PY
+
+            - name: Add plan to job summary
+              if: always() && steps.plan.outcome != 'skipped'
+              run: cat plan_comment.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Comment on pull request
+              if: always() && steps.plan.outcome != 'skipped'
+              env:
+                GH_TOKEN: ${{ github.token }}
+                REPO: ${{ github.repository }}
+                PR_NUMBER: ${{ github.event.pull_request.number }}
+                MARKER: "<!-- terraform-plan:${{ matrix.solution }} -->"
+              run: |
+                  set -euo pipefail
+
+                  existing_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+                      --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n1)
+
+                  if [ -n "$existing_id" ]; then
+                      gh api "repos/$REPO/issues/comments/$existing_id" -X PATCH -F body=@plan_comment.md
+                  else
+                      gh api "repos/$REPO/issues/$PR_NUMBER/comments" -X POST -F body=@plan_comment.md
+                  fi
